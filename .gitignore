@@ -1,0 +1,32 @@
+# ===== 隐私安全：以下文件绝不提交（个人信息 / API Key / 素材） =====
+
+# API 密钥（必填：你的 LongCat/DeepSeek Key）
+.env
+
+# 桌宠人格文件（含个人信息：真实姓名、学校、城市、性格）
+persona.md
+persona_b.md
+persona_*.md
+
+# 用户素材（角色帧图 / 自定义字体）
+frames/
+frames_B/
+fonts/
+
+# 对话历史 / 备忘录 / 长期记忆（含个人聊天内容与偏好）
+chat_history_*.json
+memos.json
+facts.json
+_ocr_tmp.png
+
+# 桌宠配置（本地生成，含用户创建的角色名；example 模板可提交）
+pets_config.json
+
+# ===== 构建产物 =====
+build/
+build_ai*/
+dist/
+dist_ai*/
+*.spec
+*.pyc
+__pycache__/

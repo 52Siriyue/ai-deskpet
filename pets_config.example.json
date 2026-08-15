@@ -1,0 +1,17 @@
+{
+  "说明": "桌宠配置示例：复制为 pets_config.json 后修改，或用 setup_pet.py 自动生成",
+  "pets": [
+    {
+      "name": "欣悦",
+      "frames": "frames",
+      "theme": "pink",
+      "persona": "persona.md"
+    },
+    {
+      "name": "业成",
+      "frames": "frames/B",
+      "theme": "blue",
+      "persona": "persona_b.md"
+    }
+  ]
+}
