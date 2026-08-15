@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-AI 引擎（V1）：美团 LongCat-2.0 LLM 客户端
-- OpenAI 兼容协议（base_url: https://api.longcat.chat/openai）
-- 后台线程调用（不阻塞 UI）+ 对话历史管理 + 人格注入
-- API Key 从 .env 读取（绝不写入代码）
+AI 引擎：美团 LongCat-2.0 LLM 客户端（OpenAI 兼容）
+- 流式输出（SSE）+ 打字机回调 + ReAct 思考过程
+- Function Calling 工具注册 + 调用循环 + 多步编排
+- 对话历史持久化 + 长期事实记忆（LLM 自动提取）
+- RAG 知识库注入（见 ai.knowledge）
 """
 import os
 import sys
@@ -11,81 +12,8 @@ import json
 import re
 import threading
 import urllib.request
-import urllib.error
 
-
-class KnowledgeBase:
-    """本地 RAG 知识库：轻量中文检索（字符 bigram 重合度，零依赖）。
-    知识源：备忘录 / 聊天历史 / 文档。提问时检索最相关片段注入 prompt。
-    """
-
-    def __init__(self):
-        self.docs = []    # [(text, source), ...]
-        self.index = []   # [bigram_set, ...] 与 docs 对齐
-
-    @staticmethod
-    def _bigrams(text):
-        s = re.sub(r"[^\w\u4e00-\u9fff]+", "", str(text))  # 去标点/空格
-        return {s[i:i + 2] for i in range(len(s) - 1)} if len(s) >= 2 else set(s)
-
-    def add_doc(self, text, source="知识"):
-        text = (text or "").strip()
-        if len(text) < 4:
-            return
-        self.docs.append((text, source))
-        self.index.append(self._bigrams(text))
-
-    def search(self, query, top_k=3, min_score=0.12):
-        """返回最相关的文档 [(text, source), ...]。评分 = 查询 bigram 覆盖率。"""
-        qb = self._bigrams(query)
-        if not qb:
-            return []
-        scored = []
-        for i, db in enumerate(self.index):
-            inter = len(qb & db)
-            if inter:
-                score = inter / len(qb)  # 查询覆盖率（长文档不吃亏）
-                if score >= min_score:
-                    scored.append((score, i))
-        scored.sort(key=lambda x: -x[0])
-        return [self.docs[i] for _, i in scored[:top_k]]
-
-    def load_files(self, paths):
-        """批量加载知识源文件：
-        - memos.json: [{"content": ...}]
-        - chat_history_*.json: [{"role":..., "content":...}]
-        - *.md: 全文按句切分
-        """
-        for path in (paths or []):
-            if not path or not os.path.exists(path):
-                continue
-            try:
-                if path.endswith(".json"):
-                    with open(path, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    if isinstance(data, list):
-                        for item in data:
-                            if isinstance(item, dict):
-                                content = item.get("content", "") or ""
-                                if content:
-                                    self.add_doc(content, "备忘" if "memo" in path else "对话")
-                elif path.endswith((".md", ".txt")):
-                    with open(path, "r", encoding="utf-8") as f:
-                        text = f.read()
-                    for line in re.split(r"[\n。！？!?]", text):
-                        line = line.strip()
-                        if len(line) >= 6:
-                            self.add_doc(line, "文档")
-            except Exception:
-                continue
-
-    def build_prompt(self, query, top_k=3):
-        """检索并生成注入 prompt 片段（无结果返回空串）"""
-        hits = self.search(query, top_k)
-        if not hits:
-            return ""
-        lines = [f"- {text}" for text, _ in hits]
-        return "\n【桌宠已知的信息（可参考回答，不确定就明说）】\n" + "\n".join(lines)
+from .knowledge import KnowledgeBase
 
 
 def load_env(env_path=None):
@@ -114,7 +42,7 @@ def load_env(env_path=None):
 
 
 class AIEngine:
-    """LLM 对话引擎：美团 LongCat-2.0，OpenAI 兼容。V2 支持 Function Calling 工具调用。"""
+    """LLM 对话引擎：美团 LongCat-2.0，OpenAI 兼容。支持 Function Calling + 流式 + RAG + 长期记忆。"""
 
     def __init__(self, persona="", history_limit=20, history_file=None, facts_file=None):
         load_env()

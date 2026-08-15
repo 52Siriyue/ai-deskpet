@@ -8,7 +8,8 @@ if BASE not in sys.path:
     sys.path.insert(0, BASE)
 os.chdir(BASE)
 
-from ai_engine import KnowledgeBase, AIEngine
+from ai.knowledge import KnowledgeBase
+from ai.engine import AIEngine
 import main as m
 
 

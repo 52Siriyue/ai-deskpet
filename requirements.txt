@@ -1,0 +1,12 @@
+PyQt5>=5.15
+Pillow>=10.0
+opencv-python-headless>=4.10
+rembg>=2.0
+onnxruntime>=1.16
+comtypes>=1.2
+
+# 可选（素材处理工具用）
+# diffusers>=0.27          # Stable Diffusion 生成（tools 可选）
+# modelscope>=1.15         # 国内模型下载（tools 可选）
+# transformers>=4.40
+# accelerate>=0.29

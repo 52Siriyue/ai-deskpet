@@ -131,28 +131,9 @@ def load_frames(subdir=None, frames_dir=None):
 
 
 # ============================================================
-# 表情占位符 → 真实 emoji 映射（LongCat 回复用 [捂脸] 等腾讯系文本表情）
+# 表情占位符 → 真实 emoji 映射（见 ai/emoji.py）
 # ============================================================
-EMOJI_MAP = {
-    "捂脸": "🤦", "嘿嘿": "😁", "大笑": "😂", "笑哭": "😂", "哈哈": "😄",
-    "哭泣": "😭", "大哭": "😭", "流泪": "😭", "委屈": "😢", "难过": "😔",
-    "微笑": "😊", "开心": "😄", "高兴": "😄", "可爱": "🥰", "害羞": "😳",
-    "调皮": "😜", "吐舌": "😛", "惊讶": "😲", "惊恐": "😱", "哇": "😮",
-    "思考": "🤔", "疑问": "🤔", "无语": "😑", "汗": "😅", "流汗": "😅",
-    "生气": "😠", "愤怒": "😡", "白眼": "🙄", "翻白眼": "🙄",
-    "爱心": "❤️", "亲亲": "😘", "飞吻": "😘", "色": "😍", "喜欢": "😍",
-    "鼓掌": "👏", "赞": "👍", "棒": "👍", "加油": "💪", "耶": "✌️",
-    "酷": "😎", "睡觉": "😴", "嘘": "🤫", "拜托": "🥺", "求求": "🥺",
-    "坏笑": "😏", "神秘": "🤫", "星星眼": "🤩", "天啊": "😱",
-}
-EMOJI_TAG_RE = re.compile(r"\[([^\[\]]{1,8})\]")
-
-
-def fix_emoji(text):
-    """把 [表情] 占位符转成真实 emoji；未知标签直接删除"""
-    if not text or "[" not in text:
-        return text
-    return EMOJI_TAG_RE.sub(lambda m: EMOJI_MAP.get(m.group(1), ""), text)
+from ai.emoji import EMOJI_MAP, fix_emoji  # noqa: E402
 
 
 # ============================================================
@@ -887,7 +868,7 @@ class PetWindow(QWidget):
         # AI 引擎（美团 LongCat-2.0，Persona 人格注入 + 记忆持久化）
         self.ai = None
         try:
-            from ai_engine import AIEngine
+            from ai.engine import AIEngine
             _persona = ""
             # 不同桌宠用各自 persona（配置驱动；默认：欣悦→persona.md，其他→persona_b.md）
             _here = os.path.dirname(os.path.abspath(__file__))
