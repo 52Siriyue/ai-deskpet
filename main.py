@@ -28,7 +28,8 @@ from PyQt5.QtWidgets import (QApplication, QWidget, QMenu, QAction, QLabel,
 from PyQt5.QtGui import (QPixmap, QPainter, QColor, QFont, QBrush, QPen, QTransform,
                          QPainterPath, QRadialGradient, QLinearGradient, QBitmap)
 from PyQt5.QtCore import (Qt, QTimer, QPoint, QRect, QPropertyAnimation,
-                          QEasingCurve, pyqtProperty, QSize, QTime, pyqtSignal)
+                          QEasingCurve, pyqtProperty, QSize, QTime, pyqtSignal,
+                          QAbstractNativeEventFilter)
 from PyQt5.QtNetwork import QLocalSocket, QLocalServer
 
 # ============================================================
@@ -615,7 +616,15 @@ class ChatLogWindow(QWidget):
         self.msg_layout.setContentsMargins(12, 8, 12, 8)
         self.msg_layout.setSpacing(10)
         self.msg_layout.addStretch()
+        self._streaming = {}  # sender -> 流式气泡引用（支持多桌宠并行流式）
+        self.messages = []  # 持久化消息 [(sender, text)]，真实对话历史
+        self._load_history()
         self.scroll.setWidget(self.msg_container)
+        # 粘底跟随：内容变高时自动滚到底；用户上翻历史时不打扰，滚回底部恢复跟随
+        self._stick_bottom = True
+        _bar = self.scroll.verticalScrollBar()
+        _bar.rangeChanged.connect(self._on_range_changed)
+        _bar.valueChanged.connect(self._on_scroll_value)
         # 输入区
         bottom = QHBoxLayout()
         bottom.setContentsMargins(12, 6, 12, 12)
@@ -629,7 +638,16 @@ class ChatLogWindow(QWidget):
             QPushButton:hover { background: #ff6f91; }
         """)
         send_btn.clicked.connect(self._send)
+        stop_btn = QPushButton("⏹ 停止")
+        stop_btn.setStyleSheet("""
+            QPushButton { background: #f5e1e6; color: #b0566a; border: 1px solid #ffc0cb;
+                          border-radius: 10px; padding: 8px 12px;
+                          font-family: Microsoft YaHei; font-size: 12px; }
+            QPushButton:hover { background: #ffd6e0; }
+        """)
+        stop_btn.clicked.connect(self._stop_all_streams)
         bottom.addWidget(self.input, 1)
+        bottom.addWidget(stop_btn)
         bottom.addWidget(send_btn)
         # 组装
         main = QVBoxLayout(self)
@@ -637,6 +655,58 @@ class ChatLogWindow(QWidget):
         main.addLayout(head)
         main.addWidget(self.scroll, 1)
         main.addLayout(bottom)
+
+    def _scroll_to_bottom(self):
+        """强制滚动到底（用户发消息 / 打开窗口）：设为粘底并立即滚动"""
+        self._stick_bottom = True
+        bar = self.scroll.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    # ---------- 聊天记录持久化（重启不丢） ----------
+    def _log_path(self):
+        d = os.path.dirname(os.path.abspath(sys.argv[0]))
+        return os.path.join(d, "chatlog.json")
+
+    def _save(self):
+        try:
+            with open(self._log_path(), "w", encoding="utf-8") as f:
+                json.dump(self.messages[-200:], f, ensure_ascii=False, indent=1)
+        except Exception:
+            pass
+
+    def _load_history(self):
+        """启动时加载历史聊天记录（容错：文件损坏/缺失时静默忽略）"""
+        p = self._log_path()
+        if not os.path.exists(p):
+            return
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for item in data:
+                if (isinstance(item, list) and len(item) == 2
+                        and isinstance(item[0], str) and isinstance(item[1], str)
+                        and item[1].strip()):
+                    self.messages.append((item[0], item[1]))
+                    self._add_message_internal(item[0], item[1])
+        except Exception:
+            pass
+
+    def _maybe_scroll(self):
+        """粘底跟随（桌宠流式 / 系统消息）：用户粘底才滚，上翻历史不打扰"""
+        if getattr(self, '_stick_bottom', True):
+            bar = self.scroll.verticalScrollBar()
+            bar.setValue(bar.maximum())
+
+    def _on_range_changed(self, mn, mx):
+        """内容高度变化（新消息/流式变高）：粘底时自动滚到底"""
+        if getattr(self, '_stick_bottom', True):
+            bar = self.scroll.verticalScrollBar()
+            bar.setValue(mx)
+
+    def _on_scroll_value(self, val):
+        """用户滚动：滚回底部→恢复粘底；上翻历史→暂停跟随（不打扰）"""
+        bar = self.scroll.verticalScrollBar()
+        self._stick_bottom = (val >= bar.maximum() - 60)
 
     def add_system(self, text):
         """居中灰色小字系统消息（如工具调用提示）"""
@@ -646,8 +716,7 @@ class ChatLogWindow(QWidget):
         lbl.setStyleSheet("color: #b08a96; font-size: 12px; font-family: Microsoft YaHei;")
         row.addWidget(lbl)
         self.msg_layout.insertLayout(self.msg_layout.count() - 1, row)
-        QTimer.singleShot(0, lambda: self.scroll.verticalScrollBar().setValue(
-            self.scroll.verticalScrollBar().maximum()))
+        self._maybe_scroll()  # 系统消息：粘底跟随，不打扰上翻历史
 
     def _bubble_style(self, mine):
         bg = "#ffffff"
@@ -681,11 +750,15 @@ class ChatLogWindow(QWidget):
         return label
 
     def add_message(self, sender, text):
-        """添加一条消息：sender = 'user' | 桌宠名"""
-        text = text.strip()
-        if not text:
-            return
-        # 桌宠消息显示时转换表情占位符 [捂脸] → 🤦
+        """添加一条消息：sender = 'user' | 桌宠名（用户消息强制滚到底）"""
+        self._add_message_internal(sender, text, force_scroll=(sender == "user"))
+        # 持久化：真实对话消息（不含系统提示/工具调用）
+        self.messages.append((sender, text))
+        self._save()
+
+    def _add_message_internal(self, sender, text, force_scroll=False):
+        """内部：创建消息行，返回气泡 QLabel（供流式更新复用）
+        force_scroll=True 强制滚到底（用户消息）；False 粘底跟随（桌宠流式）"""
         if sender != "user":
             text = fix_emoji(text)
         row = QHBoxLayout()
@@ -694,6 +767,7 @@ class ChatLogWindow(QWidget):
         bubble = QLabel(text)
         bubble.setWordWrap(True)
         bubble.setMaximumWidth(280)
+        bubble.setTextInteractionFlags(Qt.TextSelectableByMouse)  # 消息可选中复制
         bubble.setStyleSheet(self._bubble_style(sender == "user"))
         name_tag = QLabel("你" if sender == "user" else sender)
         name_tag.setStyleSheet("color: #b08a96; font-size: 11px; font-family: Microsoft YaHei;")
@@ -716,22 +790,71 @@ class ChatLogWindow(QWidget):
             row.addLayout(col)
             row.addStretch()
         self.msg_layout.insertLayout(self.msg_layout.count() - 1, row)
-        # 滚动到底部
-        QTimer.singleShot(0, lambda: self.scroll.verticalScrollBar().setValue(
-            self.scroll.verticalScrollBar().maximum()))
+        # 用户消息强制滚到底；桌宠流式粘底跟随（不打扰上翻历史）
+        if force_scroll:
+            self._scroll_to_bottom()
+        else:
+            self._maybe_scroll()
+        return bubble
+
+    def showEvent(self, event):
+        """窗口打开时滚动到底部：看到最新对话"""
+        super().showEvent(event)
+        self._scroll_to_bottom()
+
+    def begin_stream(self, sender):
+        """开始一条流式消息（空气泡），与桌宠打字机同步（多桌宠可并行）"""
+        self._streaming[sender] = self._add_message_internal(sender, "")
+
+    def update_stream(self, sender, text):
+        """流式更新某桌宠的流式消息文本（打字机同步）"""
+        bubble = self._streaming.get(sender)
+        if bubble is not None:
+            bubble.setText(fix_emoji(text))
+            # 逐字更新时滚动跟随：新字始终在视野内（粘底跟随）
+            self._maybe_scroll()
+
+    def end_stream(self, sender):
+        """流式结束：收尾某桌宠的流式消息（完整文本记入持久化历史）"""
+        bubble = self._streaming.pop(sender, None)
+        if bubble is not None:
+            txt = bubble.text().strip()
+            if txt:
+                self.messages.append((sender, txt))
+                self._save()
+
+    def _dispatch_chat(self, text):
+        """聊天消息统一分发：
+        提到某桌宠名字 → 定向给它回答；否则 → 所有桌宠双人模式同时回答。"""
+        pets = [p for p in ChatLogWindow.PET_INSTANCES.values() if p]
+        if not pets:
+            return
+        for p in pets:
+            if p.name in text:
+                p._chat_with(text)
+                return
+        for i, p in enumerate(pets):
+            p._chat_with(text, log_user=(i == 0))
+
+    def _stop_all_streams(self):
+        """⏹ 停止按钮：停止所有桌宠的流式输出"""
+        for pet in ChatLogWindow.PET_INSTANCES.values():
+            if pet is not None:
+                try:
+                    pet.stop_stream()
+                except Exception:
+                    pass
 
     def _send(self):
         text = self.input.text().strip()
         if not text:
             return
         self.input.clear()
-        pet = self._pick_pet(text)
-        if pet is None:
+        if not [p for p in ChatLogWindow.PET_INSTANCES.values() if p]:
             self.add_message("user", text)
             self.add_message("欣悦", "先右键桌宠打开聊天，我才能回你哦～")
             return
-        # 用户消息记录交给 _chat_with 统一处理（避免重复）
-        pet._chat_with(text)
+        self._dispatch_chat(text)
 
     def _pick_pet(self, text):
         """根据消息内容/历史选择回复桌宠：
@@ -860,6 +983,7 @@ class PetWindow(QWidget):
         self.base_y = 0
         self._last_global_x = 0
         self._drag_bob = 0
+        self._last_fly_collide = 0.0  # 飞行碰撞冷却时间戳
 
         # 对话气泡
         self.bubble = Bubble(name=self.name,
@@ -976,6 +1100,8 @@ class PetWindow(QWidget):
         self.chat_timer.start(random.randint(25000, 50000))
         # 流式打字机：缓冲 + 逐字定时器（服务端 chunk 多大都逐字显示）
         self._type_buf = ""
+        self._type_text = ""  # 打字机独立累积（台词拦截：不依赖气泡内容）
+        self._pending_done = False  # done 已到但打字机未完（不打断流式）
         self._type_timer = QTimer(self)
         self._type_timer.timeout.connect(self._type_tick)
         # Agent 任务管理：提醒列表（可查询/取消）
@@ -984,6 +1110,14 @@ class PetWindow(QWidget):
         self.show()
 
     # ---------- 尺寸与绘制 ----------
+    def _clamp_pos(self, x, y):
+        """把窗口位置钳制在屏幕可用区域内（窗口任何部分不出界）"""
+        screen = QApplication.primaryScreen().availableGeometry()
+        w, h = self.width(), self.height()
+        x = max(screen.left(), min(x, screen.right() - w))
+        y = max(screen.top(), min(y, screen.bottom() - h))
+        return x, y
+
     def _update_size(self):
         # 基准图用帧图首帧（桌宠真实形象），帧图缺失才退回 original_pix
         src = self.original_pix
@@ -1222,6 +1356,9 @@ class PetWindow(QWidget):
 
     def _pet_tick(self):
         """摸头动画推进"""
+        if self.state != "pet":
+            self.pet_timer.stop()  # 被甩飞/互动打断时不再回 idle（防止覆盖 throw 等状态）
+            return
         self.pet_anim += 1
         if self.pet_anim >= 24:  # 约 1.7 秒
             self.pet_timer.stop()
@@ -1440,6 +1577,8 @@ class PetWindow(QWidget):
                 self.scale = float(s.get("scale", self.scale))
                 self._update_size()
                 self.move(int(s.get("x", self.x())), int(s.get("y", self.y())))
+                # 加载的位置钳制在屏幕内（分辨率变化/上次拖出界时修正）
+                self.move(*self._clamp_pos(self.x(), self.y()))
                 if not s.get("top", True):
                     self._toggle_top()
                 # 心情/饱食度持久化
@@ -1693,11 +1832,13 @@ class PetWindow(QWidget):
                 # 拖动时进入跑步状态
                 if self.state not in ("jump", "squash", "shake"):
                     self._set_state("drag")
-                    self.flip = (e.globalPos().x() < self._last_global_x) if hasattr(self, '_last_global_x') else False
-                self.move(new_pos)
+                    self.flip = (e.globalPos().x() < self._last_global_x)
+                # 边界钳制：拖拽中窗口任何部分不出屏幕
+                nx, ny = self._clamp_pos(new_pos.x(), new_pos.y())
+                self.move(nx, ny)
                 self._last_global_x = e.globalPos().x()
                 # 拖动时上下轻微浮动模拟跑步
-                self._drag_bob = (self._drag_bob + 1) % 8 if hasattr(self, '_drag_bob') else 0
+                self._drag_bob = (self._drag_bob + 1) % 8
                 # 记录速度（甩飞检测用）
                 now = time.monotonic()
                 if self._prev_pos is not None and self._prev_t:
@@ -1733,11 +1874,7 @@ class PetWindow(QWidget):
         push = 30
         nx = p.x() - int(dx / math.hypot(dx, dy) * push)
         ny = p.y() - int(dy / math.hypot(dx, dy) * push)
-        sw = QApplication.primaryScreen().availableGeometry().width()
-        sh = QApplication.primaryScreen().availableGeometry().height()
-        nx = max(0, min(nx, sw - p.width()))
-        ny = max(0, min(ny, sh - p.height()))
-        p.move(nx, ny)
+        p.move(*p._clamp_pos(nx, ny))
 
     def mouseReleaseEvent(self, e):
         if e.button() == Qt.LeftButton and self._drag_pos:
@@ -1747,8 +1884,8 @@ class PetWindow(QWidget):
                 # 甩飞检测：速度够快就甩出去弹回
                 speed = math.hypot(self._vx, self._vy)
                 if speed > 2500:
-                    # 固定飞行初速（与鼠标拖拽速度无关，方向沿拖拽方向）
-                    FIXED_SPEED = 200.0
+                    # 固定飞行初速（单位 px/s，方向沿拖拽方向）
+                    FIXED_SPEED = 3000.0
                     if speed > 1:
                         dir_x = self._vx / speed
                         dir_y = self._vy / speed
@@ -1768,14 +1905,19 @@ class PetWindow(QWidget):
             e.accept()
 
     def _throw_tick(self):
-        """甩飞弹回：翻滚旋转 + 撞边缘反弹（每次碰撞大幅减速）"""
-        self.throw_vel[0] *= 0.96
-        self.throw_vel[1] *= 0.96
+        """甩飞弹回：翻滚旋转 + 撞边缘反弹（速度单位 px/s，每 tick 16ms）"""
+        if self.state != "throw":
+            self.throw_timer.stop()  # 状态被打断（_stop_all 等）→ 停止飞行，防止幽灵移动
+            return
+        # 每 tick 1.5% 衰减（0.985^250≈0.02，600px/s 飞行约 4 秒）
+        self.throw_vel[0] *= 0.985
+        self.throw_vel[1] *= 0.985
         # 翻滚：速度越快转得越快
         speed = abs(self.throw_vel[0]) + abs(self.throw_vel[1])
         self.throw_angle = (self.throw_angle + speed * 0.07) % 360
-        nx = self.x() + int(self.throw_vel[0])
-        ny = self.y() + int(self.throw_vel[1])
+        # px/s → 每 tick 位移（16ms）
+        nx = self.x() + int(self.throw_vel[0] * 0.016)
+        ny = self.y() + int(self.throw_vel[1] * 0.016)
         sw = QApplication.primaryScreen().availableGeometry().width()
         sh = QApplication.primaryScreen().availableGeometry().height()
         # 边缘反弹（每次碰撞损耗约 68% 速度，更温和）
@@ -1792,12 +1934,36 @@ class PetWindow(QWidget):
             ny = sh - self.height()
             self.throw_vel[1] = -abs(self.throw_vel[1]) * 0.32
         self.move(nx, ny)
+        self._fly_collision()  # 飞行中 16ms 级碰撞检测（高速也不穿模）
         self.update()
-        if speed < 10:
+        if speed < 30:  # px/s 低于阈值 → 落地
             self.throw_timer.stop()
             self.throw_angle = 0
             self._anim_squash()  # 落地压扁缓冲（自动回 idle）
             self._say(random.choice(["晕乎乎的…", "转圈圈了～", "呼…站稳了！"]))
+
+    def _fly_collision(self):
+        """飞行碰撞（16ms 级）：飞行中撞到伙伴 → 动量碰撞撞飞（带冷却防重复）"""
+        mgr = getattr(self, "manager", None)
+        p = self.partner
+        if not mgr or not p or not p.isVisible():
+            return
+        if self.state != "throw":
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_last_fly_collide", 0.0) < 0.15:
+            return  # 150ms 冷却：避免一帧内重复动量交换
+        ax = self.x() + self.width() / 2
+        ay = self.y() + self.height() / 2
+        bx = p.x() + p.width() / 2
+        by = p.y() + p.height() / 2
+        dist = math.hypot(bx - ax, by - ay)
+        ra = self.width() * 0.40
+        rb = p.width() * 0.40
+        if dist >= (ra + rb) * 0.9:
+            return
+        self._last_fly_collide = now
+        mgr._momentum_collide(self, p, ax, ay, bx, by, dist, ra, rb)
 
     def wheelEvent(self, e):
         # 滚轮缩放
@@ -1810,7 +1976,7 @@ class PetWindow(QWidget):
         cx = self.x() + self.width() // 2
         cy = self.y() + self.height() // 2
         self._update_size()
-        self.move(cx - self.width() // 2, cy - self.height() // 2)
+        self.move(*self._clamp_pos(cx - self.width() // 2, cy - self.height() // 2))
         self.update()
         e.accept()
 
@@ -1842,15 +2008,63 @@ class PetWindow(QWidget):
         self.anim_timer.start(16)
 
     def _anim_tick(self):
+        # ---------- walk（走路） ----------
+        if self.state == "walk":
+            screen = QApplication.primaryScreen().availableGeometry()
+            new_x = self.x() + self.walk_dir * 4
+            if new_x <= screen.left():
+                new_x = screen.left()
+                self.walk_dir = 1
+            elif new_x + self.width() >= screen.right():
+                new_x = screen.right() - self.width()
+                self.walk_dir = -1
+            self.flip = (self.walk_dir < 0)
+            self.anim_frame += 1
+            bob = int(5 * math.sin(self.anim_frame * 0.35))
+            self.move(new_x, self.base_y + bob)
+            self.update()
+            return
+        # ---------- follow（跟随鼠标） ----------
+        if self.state == "follow":
+            scr = QApplication.primaryScreen()
+            cursor = scr.cursor().pos() if hasattr(scr, "cursor") else QApplication.desktop().cursor().pos()
+            tx = cursor.x()
+            ty = cursor.y() - 70
+            p = self.partner
+            if p and p.isVisible() and p.state == "follow":
+                ox = self.x() - p.x()
+                oy = self.y() - p.y()
+                od = math.hypot(ox, oy)
+                if od > 10:
+                    tx += ox / od * 80
+                    ty += oy / od * 40
+                else:
+                    tx += 80
+            cx = self.x() + self.width() // 2
+            cy = self.y() + self.height() // 2
+            dx = tx - cx
+            dy = ty - cy
+            dist = math.hypot(dx, dy)
+            if dist > 12:
+                speed = min(self.follow_speed, dist / 12)
+                nx = self.x() + int(dx / dist * speed)
+                ny = self.y() + int(dy / dist * speed)
+                self.flip = (dx < 0)
+                nx, ny = self._clamp_pos(nx, ny)  # 边界钳制：跟随不跑出屏幕
+                self.move(nx, ny)
+            self.anim_frame += 1
+            self.update()
+            return
+        # ---------- jump / shake / squash 动画 ----------
         self.anim_frame += 1
         if self.state == "jump":
             t = self.anim_frame / self.anim_total
             jump_h = 80 * math.sin(t * math.pi)
-            self.move(self.base_x, int(self.base_y - jump_h))
+            self.move(*self._clamp_pos(self.base_x, int(self.base_y - jump_h)))
         elif self.state == "shake":
             t = self.anim_frame / self.anim_total
             offset = int(12 * math.sin(t * math.pi * 4))
-            self.move(self.base_x + offset, self.base_y)
+            self.move(*self._clamp_pos(self.base_x + offset, self.base_y))
         elif self.state == "squash":
             pass  # 压扁在 paintEvent 里处理
         self.update()
@@ -1858,8 +2072,10 @@ class PetWindow(QWidget):
         if self.anim_frame >= self.anim_total:
             self.anim_timer.stop()
             if self.state in ("jump", "shake"):
-                self.move(self.base_x, self.base_y)
-            self._set_state("idle")
+                self.move(*self._clamp_pos(self.base_x, self.base_y))
+            # 只在动画状态（jump/shake/squash）才回 idle：防止覆盖 throw 等紧急状态
+            if self.state in ("jump", "shake", "squash"):
+                self._set_state("idle")
             self.update()
 
     # ---------- 多帧动画播放器 ----------
@@ -1888,7 +2104,10 @@ class PetWindow(QWidget):
             self.frame_idx = 0
 
     # ---------- 对话气泡 ----------
-    def _say(self, text, duration=2500):
+    def _say(self, text, duration=2500, force=False):
+        # 台词拦截②：AI 流式打字中，其他气泡（台词/互动语）不覆盖正在显示的回复
+        if not force and getattr(self, '_chatting', False) and getattr(self, '_stream_started', False):
+            return
         # 气泡放在角色头顶上方，不遮挡
         self.bubble.show_text(text, duration)
         self._position_bubble()
@@ -1913,6 +2132,10 @@ class PetWindow(QWidget):
             self._position_bubble()
 
     def _random_chat(self):
+        # 台词拦截①：AI 对话进行中不随机说话（防止台词覆盖正在流式的气泡）
+        if getattr(self, '_chatting', False):
+            self.chat_timer.start(15000)
+            return
         # 提醒优先级最高：全屏动画期间不随机说话打扰
         if ReminderOverlay.instance().is_active:
             self.chat_timer.start(15000)
@@ -1959,6 +2182,10 @@ class PetWindow(QWidget):
         # 双桌宠单独开关
         a_hide_self = menu.addAction(f"🙈 隐藏{self.name}")
         a_show_other = menu.addAction(f"👋 显示{self.partner.name if self.partner else '对方'}")
+        menu.addSeparator()
+        a_autostart = menu.addAction("🚀 开机自启")
+        a_autostart.setCheckable(True)
+        a_autostart.setChecked(_autostart_enabled())
         menu.addSeparator()
         a_quit = menu.addAction("❌ 退出程序")
 
@@ -2009,6 +2236,9 @@ class PetWindow(QWidget):
         elif action == a_show_other:
             if self.partner:
                 self.partner.show()  # 显示对方
+        elif action == a_autostart:
+            _set_autostart(a_autostart.isChecked())
+            self._say("已开启开机自启～" if a_autostart.isChecked() else "已关闭开机自启～", 2500)
         elif action == a_quit:
             self._save_settings()
             self.bubble.close()
@@ -2358,10 +2588,10 @@ class PetWindow(QWidget):
 
     def _do_chat(self):
         # AI 聊天：弹出输入框（流式输出，失败时兜底用本地台词）
-        text = self._chat_input("想和我聊什么呀～<br><span style='font-size:13px;color:#b08a96'>（她真的会回你哦）</span>")
+        text = self._chat_input("想和我聊什么呀～<br><span style='font-size:13px;color:#b08a96'>（提到名字可指定桌宠，否则大家都会回答）</span>")
         if not text:
             return
-        self._chat_with(text)
+        self._dispatch_chat(text)
 
     def _group_chat(self):
         """多 Agent 协作（群聊）：同一问题发给所有桌宠，各自独立人格回答"""
@@ -2373,25 +2603,30 @@ class PetWindow(QWidget):
             self._say("还没有桌宠在呢～", 3000)
             return
         self._say("好呀，让他们俩都说说～", 2500)
-        for pet in pets:
+        for i, pet in enumerate(pets):
             if pet:
                 # 各自独立实例可并行对话（不同 agent 独立人格/记忆/工具）
-                pet._chat_with(text)
+                # 用户消息只记录一次（第一只桌宠记录）
+                pet._chat_with(text, log_user=(i == 0))
 
-    def _chat_with(self, text):
-        """发起一次流式对话（聊天/划词问答/截图问答共用）"""
+    def _chat_with(self, text, log_user=True):
+        """发起一次流式对话（聊天/划词/截图问答共用）。
+        log_user=False 时（群聊后续桌宠）不重复记录用户消息。"""
         # 防止连点：上一次对话还没回复时忽略新的聊天请求
         if getattr(self, '_chatting', False):
-            self._say("我还在想上一句呢～稍等！", 2500)
+            self._say("我还在想上一句呢～稍等！", 2500, force=True)
             return
         self._stop_all()
         self._chatting = True
         self._stream_started = False
+        self._type_text = ""  # 打字机独立累积（不依赖气泡，防止台词覆盖污染）
+        self._pending_done = False  # done 已到但打字机未完（不打断流式）
         self._last_user_text = text  # 供对话后提取长期事实
         self._reason_shown = False  # ReAct 思考每轮只显示一次
         # 记录到聊天窗口（用户消息靠右）+ 设为活跃桌宠（对话框发送的回复者）
         ChatLogWindow.ACTIVE_PET = self
-        ChatLogWindow.instance().add_message("user", text)
+        if log_user:
+            ChatLogWindow.instance().add_message("user", text)
         # 自动弹出聊天记录窗口（对话过程可视化，不抢焦点）
         try:
             _w = ChatLogWindow.instance()
@@ -2496,12 +2731,15 @@ class PetWindow(QWidget):
             return
         self._type_buf += delta
         if not self._type_timer.isActive():
-            self._type_timer.start(30)  # 打字机节奏：每 30ms 弹一个字
+            self._type_timer.start(55)  # 打字机节奏：每 55ms 弹一字（打字感清晰可见）
 
     def _type_tick(self):
         """打字机：每次弹出一个可见单元（字符或 [表情] 标签→emoji）"""
         if not self._type_buf:
             self._type_timer.stop()
+            if getattr(self, '_pending_done', False):
+                self._pending_done = False
+                self._finish_stream(True)
             return
         ch = self._type_buf[0]
         if ch == "[":
@@ -2512,34 +2750,97 @@ class PetWindow(QWidget):
             tag = self._type_buf[:end + 1]
             self._type_buf = self._type_buf[end + 1:]
             out = EMOJI_MAP.get(tag[1:-1], "")
-            new_text = self.bubble._text + out
+            self._type_text += out
         else:
             self._type_buf = self._type_buf[1:]
-            new_text = self.bubble._text + ch
+            self._type_text += ch
+        new_text = self._type_text  # 独立累积：气泡被台词覆盖也能正确重建
         if not getattr(self, '_stream_started', False):
             self._stream_started = True  # 首字实际显示时标记
+            # 聊天记录窗口同步：开始一条流式消息
+            try:
+                ChatLogWindow.instance().begin_stream(self.name)
+            except Exception:
+                pass
         self.bubble.set_stream_text(new_text)
         self._position_bubble()
+        # 聊天记录窗口同步：逐字更新
+        try:
+            ChatLogWindow.instance().update_stream(self.name, new_text)
+        except Exception:
+            pass
+        # 缓冲耗尽且 done 已到 → 自动收尾（流式完整打完才结束）
+        if not self._type_buf and getattr(self, '_pending_done', False):
+            self._pending_done = False
+            self._finish_stream(True)
+
+    def stop_stream(self):
+        """停止当前流式输出（聊天窗口停止按钮 / 其他桌宠）
+        - 通知后台 AI 线程尽快停止（不发 done，避免误报网络错误）
+        - 停掉打字机，**保留已打出的内容**，窗口加"已停止"提示"""
+        if self.ai is not None:
+            try:
+                self.ai.cancel()
+            except Exception:
+                pass
+        self._type_timer.stop()
+        self._type_buf = ""
+        self._pending_done = False
+        self._chatting = False
+        try:
+            _w = ChatLogWindow.instance()
+            _w.end_stream(self.name)   # 关闭流式通道（已显示的内容保留）
+            _w.add_system("⏹ 已停止")
+        except Exception:
+            pass
+        # 气泡：已打出内容保留不动；完全没内容时才提示
+        if not self.bubble._text:
+            self._say("⏹ 已停止", 1500, force=True)
 
     def _on_ai_done(self, ok):
-        """流式完成（主线程）"""
+        """流式完成（主线程）：done 到达不打断打字机，让回复完整逐字显示"""
         self._chatting = False
-        self._type_timer.stop()
         if ok and self._type_buf:
-            # 剩余未打完的字一次性排空（不再逐字，直接显示完整）
-            self.bubble.set_stream_text(self.bubble._text + self._type_buf)
+            # done 先到但打字机还有剩余：不排空，让打字机自然打完（保持完整流式观感）
+            self._pending_done = True
+            QTimer.singleShot(15000, self._flush_pending)  # 15s 兜底防卡死
+            return
+        self._type_timer.stop()
+        self._finish_stream(ok)
+
+    def _flush_pending(self):
+        """兜底：done 等待打字机超时（15s）后强制收尾，防卡死"""
+        if not getattr(self, '_pending_done', False):
+            return
+        self._pending_done = False
+        if self._type_buf:
+            full = fix_emoji(self._type_text + self._type_buf)
+            self.bubble.set_stream_text(full)
             self._type_buf = ""
             self._position_bubble()
-        if ok and (getattr(self, '_stream_started', False) or self.bubble._text):
-            # 已逐字显示完，补收尾：粒子 + 心情 + 记录到聊天窗口
+            try:
+                _w = ChatLogWindow.instance()
+                if self.name not in _w._streaming:
+                    _w.begin_stream(self.name)
+                _w.update_stream(self.name, full)
+            except Exception:
+                pass
+        self._finish_stream(True)
+
+    def _finish_stream(self, ok):
+        """流式统一收尾：窗口通道关闭 + 粒子/心情 + 长期记忆（或失败兜底）"""
+        try:
+            ChatLogWindow.instance().end_stream(self.name)
+        except Exception:
+            pass
+        if ok and (getattr(self, '_stream_started', False) or self._type_text):
+            # 已逐字显示完，补收尾：粒子 + 心情 + 聊天窗口流式消息收尾
             self.mood = min(100, self.mood + 5)
             self._spawn_hearts(2)
             self.bubble._timer.start(8000)  # 流式结束后再保留 8 秒
-            if self.bubble._text.strip():
-                ChatLogWindow.instance().add_message(self.name, self.bubble._text)
             # 长期记忆：后台提取值得记住的事实（用户偏好/重要事件）
             try:
-                _reply = self.bubble._text.strip()
+                _reply = (self._type_text or self.bubble._text).strip()
                 _user = getattr(self, "_last_user_text", "") or ""
                 if _user and _reply:
                     self.ai.extract_facts_async(
@@ -2644,7 +2945,7 @@ class PetWindow(QWidget):
             cy = self.y() + self.height() // 2
             self.scale = size / 100.0
             self._update_size()
-            self.move(cx - self.width() // 2, cy - self.height() // 2)
+            self.move(*self._clamp_pos(cx - self.width() // 2, cy - self.height() // 2))
             self.update()
 
     def _toggle_top(self):
@@ -2661,6 +2962,8 @@ class PetWindow(QWidget):
 
     def _stop_all(self):
         self.anim_timer.stop()
+        self.throw_timer.stop()  # 停止飞行（防止幽灵移动）
+        self.throw_vel = [0.0, 0.0]
         if hasattr(self, 'pet_timer'):
             self.pet_timer.stop()
             self.pet_anim = 0
@@ -2668,68 +2971,6 @@ class PetWindow(QWidget):
         self._set_state("idle")
         self.flip = False
         self.update()
-
-    # ---------- 走路 / 跟随 的 tick（覆盖通用 tick） ----------
-    # 重新实现 _anim_tick 以支持 walk/follow
-    # （上面的 _anim_tick 已处理 jump/shake/squash，这里扩展）
-
-
-# 由于 walk/follow 需要不同逻辑，用 monkey-patch 方式扩展
-_orig_tick = PetWindow._anim_tick
-
-
-def _extended_tick(self):
-    if self.state == "walk":
-        screen = QApplication.primaryScreen().availableGeometry()
-        step = 4
-        new_x = self.x() + self.walk_dir * step
-        # 边界反弹
-        if new_x <= screen.left():
-            new_x = screen.left()
-            self.walk_dir = 1
-        elif new_x + self.width() >= screen.right():
-            new_x = screen.right() - self.width()
-            self.walk_dir = -1
-        self.flip = (self.walk_dir < 0)
-        # 上下浮动（基于起始 y）
-        self.anim_frame += 1
-        bob = int(5 * math.sin(self.anim_frame * 0.35))
-        self.move(new_x, self.base_y + bob)
-        self.update()
-        return
-    if self.state == "follow":
-        cursor = QApplication.primaryScreen().cursor().pos() if hasattr(QApplication.primaryScreen(), 'cursor') else QApplication.desktop().cursor().pos()
-        # 目标点：鼠标下方；伙伴也在跟随时错开站位（各自停在不同位置，避免互相挤压振荡）
-        tx = cursor.x()
-        ty = cursor.y() - 70
-        p = self.partner
-        if p and p.isVisible() and p.state == "follow":
-            ox = self.x() - p.x()
-            oy = self.y() - p.y()
-            od = math.hypot(ox, oy)
-            if od > 10:
-                tx += ox / od * 80
-                ty += oy / od * 40
-            else:
-                tx += 80
-        cx = self.x() + self.width() // 2
-        cy = self.y() + self.height() // 2
-        dx = tx - cx
-        dy = ty - cy
-        dist = math.hypot(dx, dy)
-        if dist > 12:
-            speed = min(self.follow_speed, dist / 12)
-            nx = self.x() + int(dx / dist * speed)
-            ny = self.y() + int(dy / dist * speed)
-            self.flip = (dx < 0)
-            self.move(nx, ny)
-        self.anim_frame += 1
-        self.update()
-        return
-    _orig_tick(self)
-
-
-PetWindow._anim_tick = _extended_tick
 
 
 class PetManager:
@@ -2740,7 +2981,7 @@ class PetManager:
         self.locked = False   # 贴贴等互动期间锁定坐标（不再移动）
         self.timer = QTimer()
         self.timer.timeout.connect(self._check)
-        self.timer.start(100)   # 100ms 检查（防重叠更及时）
+        self.timer.start(30)   # 30ms 检查（飞行碰撞更及时，防高速穿模）
 
     def _check(self):
         if len(self.pets) < 2:
@@ -2768,20 +3009,16 @@ class PetManager:
                 and a.state != "drag" and b.state != "drag":
             self._momentum_collide(a, b, ax, ay, bx, by, dist, ra, rb)
             return
-        # 静态兜底推开（严格不重叠）
+        # 静态兜底推开（严格不重叠；30ms 高频下用小步长避免抖动）
         if contact:
             dx = ax - bx
             dy = ay - by
             if math.hypot(dx, dy) < 1:
                 dx, dy = 1, 0
-            push = 40
+            push = 12
             nx = b.x() - int(dx / math.hypot(dx, dy) * push)
             ny = b.y() - int(dy / math.hypot(dx, dy) * push)
-            sw = QApplication.primaryScreen().availableGeometry().width()
-            sh = QApplication.primaryScreen().availableGeometry().height()
-            nx = max(0, min(nx, sw - b.width()))
-            ny = max(0, min(ny, sh - b.height()))
-            b.move(nx, ny)
+            b.move(*b._clamp_pos(nx, ny))
         # 靠近打招呼（距离 < 250px 且冷却 > 5 秒；睡觉时不打搅）
         now = time.monotonic()
         if dist < 250 and now - self.last_greet > 5 \
@@ -2829,26 +3066,30 @@ class PetManager:
             tang_x = v[0] - (v[0] * nx + v[1] * ny) * nx
             tang_y = v[1] - (v[0] * nx + v[1] * ny) * ny
             pet.throw_vel = [tang_x + vn * nx, tang_y + vn * ny]
-            if math.hypot(*pet.throw_vel) > 12:
+            if math.hypot(*pet.throw_vel) > 30:  # px/s 阈值（与 _throw_tick 停止阈值一致）
                 if pet.state != "throw":
                     pet.throw_angle = 0
+                    pet.anim_timer.stop()  # 停掉互动/待机动画，防止 _anim_tick 覆盖 throw
                     pet._set_state("throw")
                     pet.throw_timer.start(16)
             else:
                 if pet.state == "throw":
                     pet.throw_timer.stop()
                     pet._set_state("idle")
-        # 分离（沿法线推开，避免粘住）
+        # 分离（沿法线推开，避免粘住；边界钳制不出屏）
         push = (ra + rb) * 0.9 - dist + 6
         if push > 0:
-            a.move(a.x() - int(nx * push), a.y() - int(ny * push))
-            b.move(b.x() + int(nx * push), b.y() + int(ny * push))
+            a.move(*a._clamp_pos(a.x() - int(nx * push), a.y() - int(ny * push)))
+            b.move(*b._clamp_pos(b.x() + int(nx * push), b.y() + int(ny * push)))
         # 碰撞火花
         a._spawn_hearts(2)
         b._spawn_hearts(2)
 
     def _trigger_interaction(self):
         a, b = self.pets[0], self.pets[1]
+        # 飞行/甩飞中不触发随机互动（碰撞是紧急状态，互动让路）
+        if a.state == "throw" or b.state == "throw":
+            return
         # 陪睡优先：一个睡觉时另一个走过去一起睡
         if a.state == "sleep" and b.state != "sleep":
             self._sleep_together(b, a)
@@ -2916,8 +3157,8 @@ class PetManager:
         if d < 40:
             return  # 追到了
         step = 14
-        chaser.move(chaser.x() + int(dx / d * step),
-                    chaser.y() + int(dy / d * step))
+        chaser.move(*chaser._clamp_pos(chaser.x() + int(dx / d * step),
+                                       chaser.y() + int(dy / d * step)))
         chaser.flip = (dx < 0)
 
     def _do_rps(self):
@@ -2972,8 +3213,8 @@ class PetManager:
         if d < 150:
             return
         step = 10
-        a.move(a.x() + int((bx - ax) / d * step), a.y() + int((by - ay) / d * step))
-        b.move(b.x() + int((ax - bx) / d * step), b.y() + int((ay - by) / d * step))
+        a.move(*a._clamp_pos(a.x() + int((bx - ax) / d * step), a.y() + int((by - ay) / d * step)))
+        b.move(*b._clamp_pos(b.x() + int((ax - bx) / d * step), b.y() + int((ay - by) / d * step)))
 
     def _do_highfive_now(self):
         """贴贴：锁定坐标 + 一起蹦跳 + 飘爱心"""
@@ -3038,7 +3279,7 @@ class PetManager:
     def _dance_step(self, pet, base_x, sway):
         if pet.state != "walk" or not pet.isVisible():
             return
-        pet.move(base_x + sway, pet.y())
+        pet.move(*pet._clamp_pos(base_x + sway, pet.y()))
 
     def _do_whisper(self):
         """说悄悄话：一个凑近另一个耳边"""
@@ -3059,7 +3300,8 @@ class PetManager:
         d = math.hypot(dx, dy)
         if d < 20:
             return
-        pet.move(pet.x() + int(dx / d * 24), pet.y() + int(dy / d * 24))
+        pet.move(*pet._clamp_pos(pet.x() + int(dx / d * 24),
+                                 pet.y() + int(dy / d * 24)))
 
     def _do_hug(self):
         """拥抱：靠近 + 爱心环绕 + 锁定"""
@@ -3115,8 +3357,109 @@ class PetManager:
         if d < 10:
             return
         step = 20
-        pet.move(pet.x() + int(dx / d * step), pet.y() + int(dy / d * step))
+        pet.move(*pet._clamp_pos(pet.x() + int(dx / d * step),
+                                 pet.y() + int(dy / d * step)))
         pet.flip = (dx < 0)
+
+
+# ============================================================
+# 全局快捷键（零依赖：ctypes RegisterHotKey + 事件过滤器）
+# Ctrl+Shift+C 划词问答 / Ctrl+Shift+X 截图问答 / Ctrl+Shift+L 聊天窗口
+# ============================================================
+WM_HOTKEY = 0x0312
+MOD_CONTROL, MOD_SHIFT = 0x0002, 0x0004
+
+
+class _HotkeyFilter(QAbstractNativeEventFilter):
+    """监听 WM_HOTKEY 消息并回调"""
+
+    def __init__(self, on_hotkey):
+        super().__init__()
+        self._on_hotkey = on_hotkey
+
+    def nativeEventFilter(self, eventType, message):
+        try:
+            if eventType in (b"windows_generic_MSG", "windows_generic_MSG"):
+                msg = wintypes.MSG.from_address(int(message))
+                if msg.message == WM_HOTKEY:
+                    self._on_hotkey(int(msg.wParam) & 0xFFFF)
+        except Exception:
+            pass
+        return False
+
+
+def setup_hotkeys(app, pets):
+    """注册全局快捷键。返回是否至少成功注册一个（失败静默：可能被其他程序占用）"""
+    user32 = ctypes.windll.user32
+    hotkeys = {
+        1: (ord("C"), MOD_CONTROL | MOD_SHIFT, "划词问答"),
+        2: (ord("X"), MOD_CONTROL | MOD_SHIFT, "截图问答"),
+        3: (ord("L"), MOD_CONTROL | MOD_SHIFT, "聊天窗口"),
+    }
+
+    def target():
+        for p in pets:
+            if p and p.isVisible():
+                return p
+        return pets[0] if pets else None
+
+    def on_hotkey(hid):
+        pet = target()
+        if not pet:
+            return
+        if hid == 1:
+            pet._explain_clipboard()
+        elif hid == 2:
+            pet._ask_screenshot()
+        elif hid == 3:
+            w = ChatLogWindow.instance()
+            w.show()
+            w.raise_()
+            w.activateWindow()
+
+    app.installNativeEventFilter(_HotkeyFilter(on_hotkey))
+    ok = 0
+    for hid, (vk, mods, _name) in hotkeys.items():
+        try:
+            if user32.RegisterHotKey(None, hid, mods, vk):
+                ok += 1
+        except Exception:
+            pass
+    return ok > 0
+
+
+# ============================================================
+# 开机自启（winreg 标准库，HKCU Run，零依赖）
+# ============================================================
+_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def _autostart_enabled():
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as k:
+            winreg.QueryValueEx(k, "DeskPet")
+            return True
+    except Exception:
+        return False
+
+
+def _set_autostart(on):
+    """设置/取消开机自启。成功返回 True（失败静默）"""
+    try:
+        import winreg
+        exe = os.path.abspath(sys.argv[0])
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as k:
+            if on:
+                winreg.SetValueEx(k, "DeskPet", 0, winreg.REG_SZ, f'"{exe}"')
+            else:
+                try:
+                    winreg.DeleteValue(k, "DeskPet")
+                except FileNotFoundError:
+                    pass
+        return True
+    except Exception:
+        return False
 
 
 def load_pets_config():
@@ -3195,6 +3538,11 @@ def main():
     manager = PetManager(pets)
     for pet in pets:
         pet.manager = manager
+    # 全局快捷键（失败静默：可能被其他程序占用）
+    try:
+        setup_hotkeys(app, pets)
+    except Exception:
+        pass
     sys.exit(app.exec_())
 
 

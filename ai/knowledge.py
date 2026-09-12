@@ -1,43 +1,66 @@
 # -*- coding: utf-8 -*-
-"""RAG 知识库：轻量中文检索（字符 bigram 重合度，零依赖）。
+"""RAG 知识库：轻量中文检索（字符 bigram 词元 + TF-IDF 加权，零依赖）。
 知识源：备忘录 / 聊天历史 / 文档。提问时检索最相关片段注入 prompt。
 """
 import os
 import json
 import re
+import math
 
 
 class KnowledgeBase:
-    """本地 RAG 知识库"""
+    """本地 RAG 知识库（TF-IDF 检索，比纯重合度更精准）"""
 
     def __init__(self):
-        self.docs = []    # [(text, source), ...]
-        self.index = []   # [bigram_set, ...] 与 docs 对齐
+        self.docs = []       # [(text, source), ...]
+        self._terms = []     # 每文档的 term 计数 {term: count}，与 docs 对齐
+        self._df = {}        # term -> 出现该 term 的文档数
+        self._total = 0      # 文档总数
 
     @staticmethod
-    def _bigrams(text):
-        s = re.sub(r"[^\w\u4e00-\u9fff]+", "", str(text))  # 去标点/空格
-        return {s[i:i + 2] for i in range(len(s) - 1)} if len(s) >= 2 else set(s)
+    def _tokenize(text):
+        """分词：去标点/空格 → 字符 bigram（中文无需分词库的轻量方案）"""
+        s = re.sub(r"[^\w\u4e00-\u9fff]+", "", str(text))
+        if len(s) < 2:
+            return list(s)
+        return [s[i:i + 2] for i in range(len(s) - 1)]
+
+    def _term_counts(self, text):
+        counts = {}
+        for t in self._tokenize(text):
+            counts[t] = counts.get(t, 0) + 1
+        return counts
 
     def add_doc(self, text, source="知识"):
         text = (text or "").strip()
         if len(text) < 4:
             return
+        counts = self._term_counts(text)
         self.docs.append((text, source))
-        self.index.append(self._bigrams(text))
+        self._terms.append(counts)
+        for t in counts:
+            self._df[t] = self._df.get(t, 0) + 1
+        self._total = len(self.docs)
 
-    def search(self, query, top_k=3, min_score=0.12):
-        """返回最相关的文档 [(text, source), ...]。评分 = 查询 bigram 覆盖率。"""
-        qb = self._bigrams(query)
-        if not qb:
+    def search(self, query, top_k=3, min_score=0.02):
+        """返回最相关的文档 [(text, source), ...]。TF-IDF 加权点积评分。"""
+        qc = self._term_counts(query)
+        if not qc or not self._total:
             return []
+        qn = sum(qc.values())
+        n = self._total
         scored = []
-        for i, db in enumerate(self.index):
-            inter = len(qb & db)
-            if inter:
-                score = inter / len(qb)  # 查询覆盖率（长文档不吃亏）
-                if score >= min_score:
-                    scored.append((score, i))
+        for i, counts in enumerate(self._terms):
+            dl = max(1, sum(counts.values()))
+            score = 0.0
+            for t, qf in qc.items():
+                tf_d = counts.get(t, 0) / dl
+                if tf_d <= 0:
+                    continue
+                idf = math.log((n + 1) / (self._df.get(t, 0) + 1)) + 1.0
+                score += (qf / qn) * idf * tf_d * idf
+            if score >= min_score:
+                scored.append((score, i))
         scored.sort(key=lambda x: -x[0])
         return [self.docs[i] for _, i in scored[:top_k]]
 

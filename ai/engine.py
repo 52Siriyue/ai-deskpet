@@ -16,6 +16,10 @@ import urllib.request
 from .knowledge import KnowledgeBase
 
 
+class _StreamCancelled(Exception):
+    """用户主动停止流式输出：worker 静默退出，不发 done"""
+
+
 def load_env(env_path=None):
     """从 .env 文件加载环境变量（不覆盖已存在的环境变量）。
     候选位置：源码目录 / exe 同目录 / PyInstaller _MEIPASS，保证打包后也能读到。
@@ -42,7 +46,11 @@ def load_env(env_path=None):
 
 
 class AIEngine:
-    """LLM 对话引擎：美团 LongCat-2.0，OpenAI 兼容。支持 Function Calling + 流式 + RAG + 长期记忆。"""
+    """LLM 对话引擎：OpenAI 兼容接口（默认硅基流动 Qwen3.5-9B，可切智谱/LongCat）。
+
+    支持 Function Calling 工具循环 + 流式输出 + RAG 知识库 + 长期记忆 + ReAct 回调。
+    模型通道由 .env 的 LLM_BASE_URL / LLM_MODEL / LLM_API_KEY 决定。
+    """
 
     def __init__(self, persona="", history_limit=20, history_file=None, facts_file=None):
         load_env()
@@ -61,6 +69,16 @@ class AIEngine:
         self.on_reason = None     # 思考过程回调 fn(text)（ReAct 可视化）
         self.on_observe = None    # 工具结果回调 fn(name, result)（ReAct 可视化）
         self.kb = KnowledgeBase()  # 本地 RAG 知识库
+        self._cancel = threading.Event()  # 用户停止输出：设置后 worker 尽快停止
+        self._extracting = False  # 事实提取线程互斥（防止并发写 facts.json）
+        self.last_error = None    # 最近一次流式失败的原因（便于排查静默失败）
+
+    def cancel(self):
+        """取消当前流式输出：后台线程尽快停止，不再推送增量"""
+        self._cancel.set()
+
+    def _reset_cancel(self):
+        self._cancel.clear()
 
     def _load_facts(self):
         if not self.facts_file or not os.path.exists(self.facts_file):
@@ -94,7 +112,11 @@ class AIEngine:
         return added
 
     def extract_facts_async(self, user_text, reply, on_done=None):
-        """后台线程：让 LLM 从对话中提取值得长期记住的事实（JSON 数组），回调 on_done(facts)"""
+        """后台线程：让 LLM 从对话中提取值得长期记住的事实（JSON 数组），回调 on_done(facts)
+        同一时间只允许一个提取线程（防止并发写 facts.json 竞态）"""
+        if getattr(self, "_extracting", False):
+            return
+        self._extracting = True
         def worker():
             try:
                 body = {
@@ -118,6 +140,8 @@ class AIEngine:
                     on_done(facts)
             except Exception:
                 pass
+            finally:
+                self._extracting = False
         threading.Thread(target=worker, daemon=True).start()
 
     def build_knowledge(self, paths):
@@ -157,6 +181,17 @@ class AIEngine:
             names = "、".join(t["function"]["name"] for t in self.tools)
             tools_hint = f"\n你拥有工具能力：{names}。当用户提出相关需求时，调用对应工具帮用户完成，然后用一句话确认结果。"
         system += f"\n（当前心情 {mood}/100，饱食度 {full}/100，回复控制在 1-2 句话，可用 emoji）{tools_hint}"
+        # 全局规则：集体代词响应（防止 LLM 在"你们/大家"语境下自我认知混乱）
+        system += ("\n\n## 集体代词响应规则\n"
+                   "用户称呼\"你们/大家/两个/都\"时，你和欣悦/业成是各自独立的桌宠，"
+                   "你只回答你自己的部分（不要代替另一只桌宠说话，不要质疑对方是否存在，"
+                   "不要编造\"只有我一个/对方不在\"之类的话）。直接回答用户问题即可。")
+        # 全局红线：个性可以有，但绝不攻击用户
+        system += ("\n\n## 行为红线\n"
+                   "语气可以有个性（嘴硬/傲娇/吐槽都行），但**绝不输出贬低、侮辱、攻击、"
+                   "嘲讽用户的话**（禁止\"你是不是该吃药了\"\"你有病吧\"等），"
+                   "也不要在用户没问你身份时莫名其妙自报家门或反问\"你是不是在质疑我是谁\"。"
+                   "正常回答用户的问题。")
         # RAG：检索知识库相关片段注入
         kb_hint = self.kb.build_prompt(user_text) if getattr(self, "kb", None) else ""
         if kb_hint:
@@ -243,13 +278,25 @@ class AIEngine:
         线程安全约定：on_delta / on_done 必须传 Qt 信号 emit（跨线程自动排队到主线程）。
         on_done(ok: bool) —— ok=True 流式完成，ok=False 出错（调用方兜底本地台词）。
         """
+        self._reset_cancel()
         def worker():
             ok = False
             try:
                 self._chat_stream_impl(user_text, on_delta, mood, full, timeout)
                 ok = True
-            except Exception:
+            except _StreamCancelled:
+                return  # 用户主动停止：不发 done，由主线程 stop_stream 收尾
+            except Exception as exc:
+                # 不要静默吞异常：以前这里什么都不记，导致"工具调用后气泡空了"
+                # 这类问题完全无法定位。现在打印到 stderr 并留一份 last_error 供排查。
                 ok = False
+                self.last_error = exc
+                try:
+                    import traceback
+                    print(f"[AIEngine] 流式失败: {type(exc).__name__}: {exc}", file=sys.stderr)
+                    traceback.print_exc(file=sys.stderr)
+                except Exception:
+                    pass
             on_done(ok)
         threading.Thread(target=worker, daemon=True).start()
 
@@ -320,6 +367,8 @@ class AIEngine:
         reason_buf = ""
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             for raw in resp:  # 逐行读 SSE
+                if self._cancel.is_set():
+                    raise _StreamCancelled()  # 用户停止：立即终止流式
                 line = raw.decode("utf-8", errors="replace").strip()
                 if not line.startswith("data:"):
                     continue
@@ -357,7 +406,12 @@ class AIEngine:
                         entry["arguments"] += fn["arguments"]
         tool_calls = None
         if tc_map:
+            # 注意：必须带 "type": "function"。OpenAI 规范要求每个 tool_call 声明类型，
+            # 缺了它 SiliconFlow/通义等严格校验的服务会回 400
+            # （"Input should be 'function'"），导致工具结果回灌失败、桌宠静默不说话。
+            # LongCat 等宽容服务不报错，容易掩盖这个问题。
             tool_calls = [{"id": e["id"],
+                           "type": "function",
                            "function": {"name": e["name"], "arguments": e["arguments"]}}
                           for _, e in sorted(tc_map.items())]
         return full, tool_calls
