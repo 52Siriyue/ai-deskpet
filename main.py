@@ -135,6 +135,7 @@ def load_frames(subdir=None, frames_dir=None):
 # 表情占位符 → 真实 emoji 映射（见 ai/emoji.py）
 # ============================================================
 from ai.emoji import EMOJI_MAP, fix_emoji  # noqa: E402
+from ai.stream_buffer import StreamBuffer  # noqa: E402
 
 
 # ============================================================
@@ -1099,9 +1100,9 @@ class PetWindow(QWidget):
         self.chat_timer.timeout.connect(self._random_chat)
         self.chat_timer.start(random.randint(25000, 50000))
         # 流式打字机：缓冲 + 逐字定时器（服务端 chunk 多大都逐字显示）
-        self._type_buf = ""
-        self._type_text = ""  # 打字机独立累积（台词拦截：不依赖气泡内容）
-        self._pending_done = False  # done 已到但打字机未完（不打断流式）
+        # 流式打字机状态机（纯逻辑，见 ai/stream_buffer.py）。
+        # 每个 Agent 各持一份实例 → 并发隔离由构造保证，不再依赖 name 字符串约定。
+        self.sb = StreamBuffer(EMOJI_MAP)
         self._type_timer = QTimer(self)
         self._type_timer.timeout.connect(self._type_tick)
         # Agent 任务管理：提醒列表（可查询/取消）
@@ -2106,7 +2107,7 @@ class PetWindow(QWidget):
     # ---------- 对话气泡 ----------
     def _say(self, text, duration=2500, force=False):
         # 台词拦截②：AI 流式打字中，其他气泡（台词/互动语）不覆盖正在显示的回复
-        if not force and getattr(self, '_chatting', False) and getattr(self, '_stream_started', False):
+        if not force and getattr(self, '_chatting', False) and self.sb.started:
             return
         # 气泡放在角色头顶上方，不遮挡
         self.bubble.show_text(text, duration)
@@ -2618,9 +2619,7 @@ class PetWindow(QWidget):
             return
         self._stop_all()
         self._chatting = True
-        self._stream_started = False
-        self._type_text = ""  # 打字机独立累积（不依赖气泡，防止台词覆盖污染）
-        self._pending_done = False  # done 已到但打字机未完（不打断流式）
+        self.sb.reset()  # 清空缓冲 / 已显示文本 / done / 首字标记
         self._last_user_text = text  # 供对话后提取长期事实
         self._reason_shown = False  # ReAct 思考每轮只显示一次
         # 记录到聊天窗口（用户消息靠右）+ 设为活跃桌宠（对话框发送的回复者）
@@ -2727,37 +2726,25 @@ class PetWindow(QWidget):
 
     def _on_ai_delta(self, delta):
         """流式增量（主线程）：塞入打字机缓冲，逐字显示"""
-        if not delta:
+        if not self.sb.feed(delta).pending:
             return
-        self._type_buf += delta
         if not self._type_timer.isActive():
             self._type_timer.start(55)  # 打字机节奏：每 55ms 弹一字（打字感清晰可见）
 
     def _type_tick(self):
         """打字机：每次弹出一个可见单元（字符或 [表情] 标签→emoji）"""
-        if not self._type_buf:
-            self._type_timer.stop()
-            if getattr(self, '_pending_done', False):
-                self._pending_done = False
-                self._finish_stream(True)
+        was_started = self.sb.started   # 需在 drain 之前取：用于判断「首字」
+        consumed, _ = self.sb.drain()
+        if not consumed:
+            # 两种情况：缓冲已空，或表情标签被 chunk 拆散（等后续 chunk）
+            if not self.sb.pending:
+                self._type_timer.stop()
+                if self.sb.done:
+                    self._finish_stream(True)
             return
-        ch = self._type_buf[0]
-        if ch == "[":
-            # 表情标签：等读到 ] 再一次性输出转换后的 emoji（未知标签删掉）
-            end = self._type_buf.find("]", 1)
-            if end == -1:
-                return  # 标签未完整，等下一个 tick
-            tag = self._type_buf[:end + 1]
-            self._type_buf = self._type_buf[end + 1:]
-            out = EMOJI_MAP.get(tag[1:-1], "")
-            self._type_text += out
-        else:
-            self._type_buf = self._type_buf[1:]
-            self._type_text += ch
-        new_text = self._type_text  # 独立累积：气泡被台词覆盖也能正确重建
-        if not getattr(self, '_stream_started', False):
-            self._stream_started = True  # 首字实际显示时标记
-            # 聊天记录窗口同步：开始一条流式消息
+        new_text = self.sb.text  # 独立累积：气泡被台词覆盖也能正确重建
+        if not was_started:
+            # 首字实际显示时才开启聊天窗口的流式通道（避免空气泡）
             try:
                 ChatLogWindow.instance().begin_stream(self.name)
             except Exception:
@@ -2770,8 +2757,7 @@ class PetWindow(QWidget):
         except Exception:
             pass
         # 缓冲耗尽且 done 已到 → 自动收尾（流式完整打完才结束）
-        if not self._type_buf and getattr(self, '_pending_done', False):
-            self._pending_done = False
+        if self.sb.is_finished():
             self._finish_stream(True)
 
     def stop_stream(self):
@@ -2784,8 +2770,7 @@ class PetWindow(QWidget):
             except Exception:
                 pass
         self._type_timer.stop()
-        self._type_buf = ""
-        self._pending_done = False
+        self.sb.reset()   # 丢弃未显示的内容（已显示的部分保留在气泡里）
         self._chatting = False
         try:
             _w = ChatLogWindow.instance()
@@ -2800,9 +2785,10 @@ class PetWindow(QWidget):
     def _on_ai_done(self, ok):
         """流式完成（主线程）：done 到达不打断打字机，让回复完整逐字显示"""
         self._chatting = False
-        if ok and self._type_buf:
+        if ok:
+            self.sb.mark_done()   # 只标记「服务端结束」，是否收尾由 is_finished() 决定
+        if ok and self.sb.pending:
             # done 先到但打字机还有剩余：不排空，让打字机自然打完（保持完整流式观感）
-            self._pending_done = True
             QTimer.singleShot(15000, self._flush_pending)  # 15s 兜底防卡死
             return
         self._type_timer.stop()
@@ -2810,21 +2796,18 @@ class PetWindow(QWidget):
 
     def _flush_pending(self):
         """兜底：done 等待打字机超时（15s）后强制收尾，防卡死"""
-        if not getattr(self, '_pending_done', False):
+        if not self.sb.pending:
             return
-        self._pending_done = False
-        if self._type_buf:
-            full = fix_emoji(self._type_text + self._type_buf)
-            self.bubble.set_stream_text(full)
-            self._type_buf = ""
-            self._position_bubble()
-            try:
-                _w = ChatLogWindow.instance()
-                if self.name not in _w._streaming:
-                    _w.begin_stream(self.name)
-                _w.update_stream(self.name, full)
-            except Exception:
-                pass
+        full = self.sb.flush()          # 剩余内容一次性处理干净
+        self.bubble.set_stream_text(full)
+        self._position_bubble()
+        try:
+            _w = ChatLogWindow.instance()
+            if self.name not in _w._streaming:
+                _w.begin_stream(self.name)
+            _w.update_stream(self.name, full)
+        except Exception:
+            pass
         self._finish_stream(True)
 
     def _finish_stream(self, ok):
@@ -2833,14 +2816,14 @@ class PetWindow(QWidget):
             ChatLogWindow.instance().end_stream(self.name)
         except Exception:
             pass
-        if ok and (getattr(self, '_stream_started', False) or self._type_text):
+        if ok and (self.sb.started or self.sb.text):
             # 已逐字显示完，补收尾：粒子 + 心情 + 聊天窗口流式消息收尾
             self.mood = min(100, self.mood + 5)
             self._spawn_hearts(2)
             self.bubble._timer.start(8000)  # 流式结束后再保留 8 秒
             # 长期记忆：后台提取值得记住的事实（用户偏好/重要事件）
             try:
-                _reply = (self._type_text or self.bubble._text).strip()
+                _reply = (self.sb.text or self.bubble._text).strip()
                 _user = getattr(self, "_last_user_text", "") or ""
                 if _user and _reply:
                     self.ai.extract_facts_async(
