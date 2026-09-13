@@ -1,7 +1,10 @@
 # ===== 隐私安全：以下文件绝不提交（个人信息 / API Key / 素材） =====
 
 # API 密钥（必填：你的 LongCat/DeepSeek Key）
-.env
+# 用通配覆盖 .env.local / .env.production / .env.bak 等所有变体；
+# 单独放行可提交的模板文件（只含占位符，不含真实密钥）
+.env*
+!.env.example
 
 # 桌宠人格文件（含个人信息：真实姓名、学校、城市、性格）
 persona.md
