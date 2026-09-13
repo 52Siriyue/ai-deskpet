@@ -10,7 +10,9 @@ import os
 import sys
 import json
 import re
+import time
 import threading
+import urllib.error
 import urllib.request
 
 from .knowledge import KnowledgeBase
@@ -54,9 +56,18 @@ class AIEngine:
 
     def __init__(self, persona="", history_limit=20, history_file=None, facts_file=None):
         load_env()
+        # 主通道（向后兼容：只配 LLM_* 也能正常工作）
         self.api_key = os.environ.get("LLM_API_KEY", "")
         self.base_url = os.environ.get("LLM_BASE_URL", "https://api.longcat.chat/openai").rstrip("/")
         self.model = os.environ.get("LLM_MODEL", "LongCat-2.0")
+        # 多通道容错：主通道失败自动降级到备用通道（链的构建见 _load_providers）
+        self.providers = self._load_providers()
+        self._provider_idx = 0            # 当前使用链上的第几个通道
+        self._failed_idx = set()          # 本轮已失败的通道下标（避免重复试同一个）
+        self._main_cooldown_until = 0.0   # 主通道冷却截止（失败后一段时间内不再先试它）
+        self.main_cooldown_sec = 60       # 冷却时长（秒）
+        self.on_provider_switch = None    # 切换回调 fn(from_name, to_name, reason)
+        self._apply_provider()
         self.persona = persona
         self.history_limit = history_limit
         self.history_file = history_file  # 记忆持久化文件（None = 不持久化）
@@ -79,6 +90,97 @@ class AIEngine:
 
     def _reset_cancel(self):
         self._cancel.clear()
+
+    # ---------- 多通道容错（fallback 链） ----------
+    def _load_providers(self):
+        """按顺序收集可用通道：LLM_*（主）→ 各方括号前缀 → FALLBACK{n}_*。
+
+        同一 base_url+model 只保留一次（去重），避免主通道与备用通道重复。
+        一个都没配全时退化为仅用 LLM_*，保持与旧版本完全一致的行为。
+        """
+        chain = []
+
+        def add(name, prefix, require_key=True):
+            base = os.environ.get(prefix + "_BASE_URL", "").strip().rstrip("/")
+            model = os.environ.get(prefix + "_MODEL", "").strip()
+            key = os.environ.get(prefix + "_API_KEY", "").strip()
+            if not base or not model:
+                return
+            if require_key and not key:
+                return  # 备用通道必须有 key 才加入链
+            if any(p["base_url"] == base and p["model"] == model for p in chain):
+                return
+            chain.append({"name": name, "base_url": base, "model": model, "api_key": key})
+
+        add("主通道", "LLM", require_key=False)  # 主通道允许空 key（本地推理服务常见）
+        for prefix, label in (("ZHIPU", "智谱"), ("SILICONFLOW", "硅基流动"),
+                              ("DEEPSEEK", "DeepSeek"), ("OPENROUTER", "OpenRouter")):
+            add(label, prefix)
+        for i in (1, 2, 3, 4):
+            add("备用%d" % i, "FALLBACK%d" % i)
+        if not chain:  # 兜底：与旧版本行为一致
+            chain.append({"name": "主通道", "base_url": self.base_url,
+                          "model": self.model, "api_key": self.api_key})
+        return chain
+
+    def _apply_provider(self):
+        """把当前通道参数同步到 base_url / api_key / model（其余代码只认这三个属性）。"""
+        p = self.providers[self._provider_idx]
+        self.base_url = p["base_url"]
+        self.api_key = p["api_key"]
+        self.model = p["model"]
+
+    def provider_label(self):
+        """当前通道的可读名称（日志 / UI 用）。"""
+        return "%s｜%s" % (self.providers[self._provider_idx]["name"], self.model)
+
+    def _begin_request(self):
+        """每轮请求开始：清空失败记录；若主通道在冷却期内，直接从备用通道起步。"""
+        self._failed_idx.clear()
+        self._provider_idx = 0
+        if (len(self.providers) > 1 and self._main_cooldown_until
+                and time.time() < self._main_cooldown_until):
+            self._provider_idx = 1  # 主通道刚失败过，别浪费一次超时
+        self._apply_provider()
+
+    def _rotate_provider(self, exc=None):
+        """当前通道失败 → 切到下一个未失败的通道。返回是否切换成功。"""
+        self._failed_idx.add(self._provider_idx)
+        if self._provider_idx == 0:
+            self._main_cooldown_until = time.time() + self.main_cooldown_sec
+        for step in range(1, len(self.providers) + 1):
+            nxt = (self._provider_idx + step) % len(self.providers)
+            if nxt in self._failed_idx:
+                continue
+            old_name = self.providers[self._provider_idx]["name"]
+            self._provider_idx = nxt
+            self._apply_provider()
+            try:
+                print("[AIEngine] 通道降级: %s → %s（原因: %s）"
+                      % (old_name, self.providers[nxt]["name"],
+                         type(exc).__name__ if exc else "未知"), file=sys.stderr)
+            except Exception:
+                pass
+            if self.on_provider_switch:
+                try:
+                    self.on_provider_switch(old_name, self.providers[nxt]["name"], exc)
+                except Exception:
+                    pass
+            return True
+        return False   # 所有通道都试过了
+
+    @staticmethod
+    def _is_retryable(exc):
+        """判断异常是否值得换个通道重试。
+
+        值得：网络层错误（连不上 / 超时 / 被重置）、限流 429、服务端 5xx。
+        401/403 是 key 失效或无权限，也值得换。
+        400 等参数类错误换了通道也一样报，不重试（免得掩盖请求本身的 bug）。
+        """
+        if isinstance(exc, urllib.error.HTTPError):
+            code = getattr(exc, "code", 0)
+            return code == 429 or code >= 500 or code in (401, 403)
+        return isinstance(exc, (urllib.error.URLError, OSError, TimeoutError))
 
     def _load_facts(self):
         if not self.facts_file or not os.path.exists(self.facts_file):
@@ -205,16 +307,24 @@ class AIEngine:
         return messages
 
     def _post(self, body, timeout):
-        req = urllib.request.Request(
-            self.base_url + "/chat/completions",
-            data=json.dumps(body).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": "Bearer " + self.api_key,
-            },
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        """非流式请求。失败时自动降级到备用通道（见 _rotate_provider）。"""
+        self._begin_request()
+        while True:
+            body["model"] = self.model  # 切通道后模型名会变，必须同步
+            req = urllib.request.Request(
+                self.base_url + "/chat/completions",
+                data=json.dumps(body).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer " + self.api_key,
+                },
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except Exception as exc:
+                if not self._is_retryable(exc) or not self._rotate_provider(exc):
+                    raise
 
     def chat(self, user_text, mood=70, full=70, timeout=30):
         """同步调用 LLM（支持工具调用循环），返回最终回复文本。
@@ -354,8 +464,39 @@ class AIEngine:
         self._save_history()
 
     def _stream_once(self, body, emit_delta, timeout):
+        """流式请求 + 多通道降级。
+
+        安全约束：只在「尚未向 UI 推送任何增量」时才允许换通道重试——
+        已经吐过字再重试会让用户看到重复/错乱的内容，此时直接抛错交给上层兜底。
+
+        另外把「静默空回复」也当成失败：上游中途断连时 SSE 循环会正常结束、
+        不抛异常，结果就成了一段空气泡。这种情况在换通道后往往能拿到正常回复。
+        """
+        self._begin_request()
+        while True:
+            body["model"] = self.model  # 切通道后模型名会变，必须同步
+            emitted = []
+            try:
+                text, tool_calls = self._stream_once_raw(body, emit_delta, timeout, emitted)
+            except _StreamCancelled:
+                raise  # 用户主动停止，不重试
+            except Exception as exc:
+                if emitted:
+                    raise  # 已经有输出，重试会导致重复
+                if not self._is_retryable(exc) or not self._rotate_provider(exc):
+                    raise
+                continue
+            # 既没内容也没工具调用 → 空回复，换通道再试
+            if not text and not tool_calls and not emitted:
+                if self._rotate_provider(None):
+                    continue
+                # 所有通道都返回空：认命，把空结果返回给上层去兜底
+            return text, tool_calls
+
+    def _stream_once_raw(self, body, emit_delta, timeout, emitted):
         """发起一次流式请求，解析 SSE，返回 (累积文本, tool_calls列表或None)。
-        若设置 on_reason，解析 reasoning_content（LLM 思考过程）并回调。"""
+        若设置 on_reason，解析 reasoning_content（LLM 思考过程）并回调。
+        emitted —— 已被推送的增量标记列表，供上层判断能否安全重试。"""
         req = urllib.request.Request(
             self.base_url + "/chat/completions",
             data=json.dumps(body).encode("utf-8"),
@@ -383,6 +524,7 @@ class AIEngine:
                 c = delta.get("content")
                 if c:
                     full += c
+                    emitted.append(1)  # 已推送过内容，之后失败不再重试（避免重复文本）
                     emit_delta(c)
                 # ReAct 思考过程（reasoning_content）→ 累积后一次性回调
                 rc = delta.get("reasoning_content")
