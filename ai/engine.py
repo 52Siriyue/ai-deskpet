@@ -66,6 +66,8 @@ class AIEngine:
         self._failed_idx = set()          # 本轮已失败的通道下标（避免重复试同一个）
         self._main_cooldown_until = 0.0   # 主通道冷却截止（失败后一段时间内不再先试它）
         self.main_cooldown_sec = 60       # 冷却时长（秒）
+        self.fallback_timeout_floor = 30  # 降级后单次请求的超时下限（秒）：
+                                          # 备用通道常比主通道慢，沿用主通道的短超时会把它一起拖死
         self.on_provider_switch = None    # 切换回调 fn(from_name, to_name, reason)
         self._apply_provider()
         self.persona = persona
@@ -181,6 +183,17 @@ class AIEngine:
             code = getattr(exc, "code", 0)
             return code == 429 or code >= 500 or code in (401, 403)
         return isinstance(exc, (urllib.error.URLError, OSError, TimeoutError))
+
+    def _attempt_timeout(self, timeout):
+        """本次尝试该用多长超时：降级后的通道给一个更宽的下限。
+
+        主通道超时通常意味着网络状况不佳，此时若沿用同样的短超时，
+        备用通道也会被拖死——故障注入实验里「主通道黑洞 + 8 秒超时」
+        会让降级同样失败，加上下限后才真正可用。
+        """
+        if self._provider_idx == 0:
+            return timeout
+        return max(timeout, self.fallback_timeout_floor)
 
     def _load_facts(self):
         if not self.facts_file or not os.path.exists(self.facts_file):
@@ -320,7 +333,7 @@ class AIEngine:
                 },
             )
             try:
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                with urllib.request.urlopen(req, timeout=self._attempt_timeout(timeout)) as resp:
                     return json.loads(resp.read().decode("utf-8"))
             except Exception as exc:
                 if not self._is_retryable(exc) or not self._rotate_provider(exc):
@@ -477,7 +490,8 @@ class AIEngine:
             body["model"] = self.model  # 切通道后模型名会变，必须同步
             emitted = []
             try:
-                text, tool_calls = self._stream_once_raw(body, emit_delta, timeout, emitted)
+                text, tool_calls = self._stream_once_raw(
+                    body, emit_delta, self._attempt_timeout(timeout), emitted)
             except _StreamCancelled:
                 raise  # 用户主动停止，不重试
             except Exception as exc:
