@@ -882,6 +882,9 @@ class PetWindow(QWidget):
     screenshot_signal = pyqtSignal(str)
     # 工具调用可视化信号（worker 线程 → 主线程聊天记录窗口）
     tool_call_signal = pyqtSignal(str)
+    # 工具活动播报信号（worker 线程 → 主线程主气泡）：
+    # 与 tool_call_signal 的区别是它传「用户可读短语」而不是技术细节
+    tool_activity_signal = pyqtSignal(str)
     # ReAct 推理链信号：思考过程 / 工具结果（worker 线程 → 主线程）
     reason_signal = pyqtSignal(str)
     observe_signal = pyqtSignal(str)
@@ -903,6 +906,7 @@ class PetWindow(QWidget):
         self.ai_done_signal.connect(self._on_ai_done)
         self.screenshot_signal.connect(self._on_screenshot_text)
         self.tool_call_signal.connect(self._on_tool_call_msg)
+        self.tool_activity_signal.connect(self._on_tool_activity)
         self.reason_signal.connect(self._on_reason_msg)
         self.observe_signal.connect(self._on_observe_msg)
         # 主题色（pink 可爱 / blue 沉稳）+ 对应台词集
@@ -1105,6 +1109,11 @@ class PetWindow(QWidget):
         self.sb = StreamBuffer(EMOJI_MAP)
         self._type_timer = QTimer(self)
         self._type_timer.timeout.connect(self._type_tick)
+        # 首字慢时的兜底反馈：1.5 秒还没吐出第一个字就先说一句话，
+        # 避免「发完消息后屏幕完全静止」被误认为卡死（快回复不会触发）
+        self._slow_ttft_timer = QTimer(self)
+        self._slow_ttft_timer.setSingleShot(True)
+        self._slow_ttft_timer.timeout.connect(self._on_slow_first_token)
         # Agent 任务管理：提醒列表（可查询/取消）
         self._reminders = []
 
@@ -2284,6 +2293,23 @@ class PetWindow(QWidget):
         return None
 
     # ---------- V2: Function Calling 工具 ----------
+    # 工具名 → 用户可读的动作短语。
+    # 工具往返期间主气泡用它播报，让「模型正在调工具」这段静默期有反馈，
+    # 而不是让气泡空着、看起来像卡死。
+    TOOL_LABELS = {
+        "set_reminder": "记下这个提醒",
+        "add_memo": "记到小本本上",
+        "start_timer": "开始计时",
+        "query_memo": "翻翻备忘录",
+        "play_minigame": "准备个小游戏",
+        "get_time": "看一眼时间",
+        "calc": "算一下",
+        "list_reminders": "翻翻提醒列表",
+        "cancel_reminder": "取消这个提醒",
+        "get_stats": "看看统计",
+        "search_web": "上网查一下",
+    }
+
     TOOLS_DEFS = [
         {"type": "function", "function": {
             "name": "set_reminder",
@@ -2496,8 +2522,15 @@ class PetWindow(QWidget):
         self.reminder_signal.connect(self._on_reminder)
         self.minigame_signal.connect(self._on_minigame)
         # 工具调用可视化：worker 线程 → 信号 → 聊天记录窗口
-        self.ai.on_tool_call = lambda name, args: self.tool_call_signal.emit(
-            f"{name}({json.dumps(args, ensure_ascii=False)[:40]})")
+        def _tool_call_emit(name, args):
+            # 聊天记录窗口：保留原有的技术性记录（工具名 + 参数）
+            self.tool_call_signal.emit(
+                f"{name}({json.dumps(args, ensure_ascii=False)[:40]})")
+            # 主气泡：人格化播报，让「模型正在调工具」这段静默期有反馈
+            label = self.TOOL_LABELS.get(name)
+            if label:
+                self.tool_activity_signal.emit(label)
+        self.ai.on_tool_call = _tool_call_emit
         # ReAct 推理链：思考过程（每轮只显示开头一次，防刷屏）/ 工具结果
         def _reason_emit(text):
             if not getattr(self, '_reason_shown', False):
@@ -2569,6 +2602,15 @@ class PetWindow(QWidget):
         """工具调用可视化（主线程）：聊天记录窗口显示 🔧 调用信息"""
         ChatLogWindow.instance().add_system(f"🔧 行动：调用工具 {desc}")
 
+    def _on_tool_activity(self, label):
+        """工具活动播报（主线程）：在主气泡说一句人话，覆盖工具往返的静默期。
+
+        此刻首字还没出（sb.started 为 False），不会被「台词拦截」挡掉；
+        等模型开始流式输出，气泡自然被打字机接管。
+        """
+        if self._chatting and not self.sb.started:
+            self._say(f"{label}…", 30000)
+
     def _on_reason_msg(self, text):
         """ReAct 思考过程（主线程）"""
         if text.strip():
@@ -2620,6 +2662,7 @@ class PetWindow(QWidget):
         self._stop_all()
         self._chatting = True
         self.sb.reset()  # 清空缓冲 / 已显示文本 / done / 首字标记
+        self._slow_ttft_timer.start(1500)  # 首字迟迟不来时先给一句反馈
         self._last_user_text = text  # 供对话后提取长期事实
         self._reason_shown = False  # ReAct 思考每轮只显示一次
         # 记录到聊天窗口（用户消息靠右）+ 设为活跃桌宠（对话框发送的回复者）
@@ -2635,11 +2678,15 @@ class PetWindow(QWidget):
             pass
         # 流式输出：无思考气泡，首字 1 秒内到达直接逐字显示
         try:
-            # 流式：增量走 ai_delta_signal，完成走 ai_done_signal（均线程安全）
+            # timeout 是 socket 层的「两次数据之间最大间隔」，不是整个请求的总时长。
+            # 45 秒太长：主通道卡住时要干等 45 秒才触发降级，而 URL 请求本身
+            # 还可能叠加备用通道的又一次超时（实测最坏 90 秒零反馈）。
+            # 正常流式不可能 12 秒不吐一个字，所以收到 12 秒是安全的；
+            # 故障时能迅速切到备用通道（降级通道另有一套更宽的超时下限）。
             self.ai.chat_async_stream(text.strip(),
                                       self.ai_delta_signal.emit,
                                       self.ai_done_signal.emit,
-                                      mood=self.mood, full=self.full, timeout=45)
+                                      mood=self.mood, full=self.full, timeout=12)
         except Exception:
             self._chatting = False
             self._say(random.choice(self.chat_lines), 3000)
@@ -2728,8 +2775,18 @@ class PetWindow(QWidget):
         """流式增量（主线程）：塞入打字机缓冲，逐字显示"""
         if not self.sb.feed(delta).pending:
             return
+        self._slow_ttft_timer.stop()   # 已经有数据了，取消「首字慢」提示
         if not self._type_timer.isActive():
             self._type_timer.start(55)  # 打字机节奏：每 55ms 弹一字（打字感清晰可见）
+
+    def _on_slow_first_token(self):
+        """首字超过 1.5 秒仍未到达：先给一句人格化反馈。
+
+        用桌宠自己说话而不是弹通用转圈 —— 既不破坏人格化观感，
+        也比 spinner 多传达一点信息。首字一到就被流式内容接管。
+        """
+        if self._chatting and not self.sb.started:
+            self._say("嗯…让我想想", 30000)
 
     def _type_tick(self):
         """打字机：每次弹出一个可见单元（字符或 [表情] 标签→emoji）"""
@@ -2770,6 +2827,7 @@ class PetWindow(QWidget):
             except Exception:
                 pass
         self._type_timer.stop()
+        self._slow_ttft_timer.stop()
         self.sb.reset()   # 丢弃未显示的内容（已显示的部分保留在气泡里）
         self._chatting = False
         try:
@@ -2785,6 +2843,7 @@ class PetWindow(QWidget):
     def _on_ai_done(self, ok):
         """流式完成（主线程）：done 到达不打断打字机，让回复完整逐字显示"""
         self._chatting = False
+        self._slow_ttft_timer.stop()
         if ok:
             self.sb.mark_done()   # 只标记「服务端结束」，是否收尾由 is_finished() 决定
         if ok and self.sb.pending:
